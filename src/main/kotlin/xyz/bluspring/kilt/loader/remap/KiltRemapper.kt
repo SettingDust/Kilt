@@ -7,6 +7,8 @@ import it.unimi.dsi.fastutil.objects.Object2ReferenceMaps
 import it.unimi.dsi.fastutil.objects.Object2ReferenceOpenHashMap
 import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.filter
@@ -15,6 +17,7 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.flow.toSet
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.stream.consumeAsFlow
 import kotlinx.coroutines.withContext
@@ -98,13 +101,14 @@ object KiltRemapper {
 
     // This is created automatically using https://github.com/BluSpring/srg2intermediary
     // srg -> intermediary
-    val srgIntermediaryMapping = IMappingFile.load(this::class.java.getResourceAsStream("/srg_intermediary.tiny")!!)
-        .run {
-            if (!forceProductionRemap)
-                this.rename(DevMappingRenamer())
-            else
-                this
-        }
+    val srgIntermediaryMapping =
+        IMappingFile.load(this::class.java.getResourceAsStream("/srg_intermediary.tiny")!!.buffered())
+            .run {
+                if (!forceProductionRemap)
+                    this.rename(DevMappingRenamer())
+                else
+                    this
+            }
     val intermediarySrgMapping = srgIntermediaryMapping.reverse()
 
     // Some workaround mappings, to remap some names to Kilt equivalents.
@@ -126,12 +130,50 @@ object KiltRemapper {
     private lateinit var remappedModsDir: Path
 
     // SRG name -> (parent class name, intermediary/mapped name)
-    val srgMappedFields = runBlocking {
-        srgIntermediaryMapping.classes.asFlow().concurrent().flatMap {
-            it.fields.asFlow().concurrent().map { f ->
-                f.original to
-                        if (!forceProductionRemap)
-                            mappingResolver.mapFieldName(
+    val srgMappedFields: Map<String, Pair<String, String>>
+
+    // SRG name -> (parent class name, intermediary/mapped name)
+    val srgMappedMethods =
+        Object2ReferenceMaps.synchronize(Object2ReferenceOpenHashMap<String, MutableMap<String, String>>())
+
+    init {
+        val srgIntermediaryMapping = srgIntermediaryMapping
+        val forceProductionRemap = forceProductionRemap
+        val mappingResolver = mappingResolver
+        val srgMappedMethods = srgMappedMethods
+
+        srgMappedFields = runBlocking {
+            async(Dispatchers.IO) {
+                srgIntermediaryMapping.classes.asFlow().concurrent().flatMap {
+                    it.fields.asFlow().concurrent().map { f ->
+                        f.original to
+                                if (!forceProductionRemap)
+                                    mappingResolver.mapFieldName(
+                                        "intermediary",
+                                        it.mapped.replace("/", "."),
+                                        f.mapped,
+                                        f.mappedDescriptor
+                                    )
+                                else
+                                    f.mapped
+                    }.merge(false)
+                }.merge(false).toSet().associateBy { it.first }
+            }.await()
+        }
+
+        runBlocking {
+            launch(Dispatchers.IO) {
+                srgIntermediaryMapping.classes.asFlow().concurrent().collect {
+                    it.methods.asFlow().concurrent().collect { f ->
+                        // otherwise FunctionalInterface methods don't get remapped properly???
+                        if (!f.mapped.startsWith("method_") && !FabricLoader.getInstance().isDevelopmentEnvironment)
+                            return@collect
+
+                        val map = srgMappedMethods.getOrPut(f.original) {
+                            Object2ReferenceMaps.synchronize(Object2ReferenceOpenHashMap())
+                        }
+                        val mapped = if (!forceProductionRemap)
+                            mappingResolver.mapMethodName(
                                 "intermediary",
                                 it.mapped.replace("/", "."),
                                 f.mapped,
@@ -139,38 +181,11 @@ object KiltRemapper {
                             )
                         else
                             f.mapped
-            }.merge(false)
-        }.merge(false).toSet().associateBy { it.first }
-    }
 
-    // SRG name -> (parent class name, intermediary/mapped name)
-    val srgMappedMethods =
-        Object2ReferenceMaps.synchronize(Object2ReferenceOpenHashMap<String, MutableMap<String, String>>())
-
-    init {
-        runBlocking {
-            srgIntermediaryMapping.classes.asFlow().concurrent().collect {
-                it.methods.asFlow().concurrent().collect { f ->
-                    // otherwise FunctionalInterface methods don't get remapped properly???
-                    if (!f.mapped.startsWith("method_") && !FabricLoader.getInstance().isDevelopmentEnvironment)
-                        return@collect
-
-                    val map = srgMappedMethods.getOrPut(f.original) {
-                        Object2ReferenceMaps.synchronize(Object2ReferenceOpenHashMap())
+                        map[f.parent.original] = mapped
                     }
-                    val mapped = if (!forceProductionRemap)
-                        mappingResolver.mapMethodName(
-                            "intermediary",
-                            it.mapped.replace("/", "."),
-                            f.mapped,
-                            f.mappedDescriptor
-                        )
-                    else
-                        f.mapped
-
-                    map[f.parent.original] = mapped
                 }
-            }
+            }.join()
         }
     }
 
@@ -610,21 +625,23 @@ object KiltRemapper {
             return exceptions
         }
 
-        mods.asFlow().concurrent()
-            .onEach { mod ->
-                runCatching {
-                    logger.info("Remapping ${mod.displayName} (${mod.modId})")
-                    val ms = measureTime {
-                        exceptions.addAll(remapMod(mod.modFile!!.toPath(), mod))
-                    }.inWholeMilliseconds
-                    logger.info("Remapped ${mod.displayName} (${mod.modId}) [took ${ms}ms]")
-                }.onFailure {
-                    logger.error("Failed to remap ${mod.displayName} (${mod.modId})", it)
-                    if (it is Exception) {
-                        exceptions.add(it)
+        coroutineScope {
+            mods.asFlow().concurrent()
+                .onEach { mod ->
+                    runCatching {
+                        logger.info("Remapping ${mod.displayName} (${mod.modId})")
+                        val ms = measureTime {
+                            exceptions.addAll(remapMod(mod.modFile!!.toPath(), mod))
+                        }.inWholeMilliseconds
+                        logger.info("Remapped ${mod.displayName} (${mod.modId}) [took ${ms}ms]")
+                    }.onFailure {
+                        logger.error("Failed to remap ${mod.displayName} (${mod.modId})", it)
+                        if (it is Exception) {
+                            exceptions.add(it)
+                        }
                     }
-                }
-            }.launchIn(Kilt.loader.scope).join()
+                }.launchIn(this).join()
+        }
 
         classProvider.close()
 
