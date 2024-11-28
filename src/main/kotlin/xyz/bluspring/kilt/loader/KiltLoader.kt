@@ -3,8 +3,14 @@ package xyz.bluspring.kilt.loader
 import com.electronwill.nightconfig.core.CommentedConfig
 import com.electronwill.nightconfig.toml.TomlParser
 import com.google.gson.JsonParser
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
+import it.unimi.dsi.fastutil.objects.ObjectArrayList
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.asFlow
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.stream.consumeAsFlow
+import kotlinx.coroutines.withContext
 import net.fabricmc.api.EnvType
 import net.fabricmc.loader.api.FabricLoader
 import net.fabricmc.loader.impl.FabricLoaderImpl
@@ -55,6 +61,12 @@ import xyz.bluspring.kilt.loader.remap.KiltRemapper
 import xyz.bluspring.kilt.util.DeltaTimeProfiler
 import xyz.bluspring.kilt.util.KiltHelper
 import xyz.bluspring.kilt.util.buildGraph
+import xyz.bluspring.kilt.util.collect
+import xyz.bluspring.kilt.util.concurrent
+import xyz.bluspring.kilt.util.filter
+import xyz.bluspring.kilt.util.launchIn
+import xyz.bluspring.kilt.util.map
+import xyz.bluspring.kilt.util.onEach
 import java.net.URL
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -75,7 +87,7 @@ import kotlin.io.path.writeBytes
 import kotlin.system.exitProcess
 
 class KiltLoader {
-    val mods = mutableListOf<ForgeMod>()
+    val mods = ObjectArrayList<ForgeMod>()
     internal val modLoadingQueue = ConcurrentLinkedQueue<ForgeMod>()
     private val tomlParser = TomlParser()
 
@@ -83,8 +95,6 @@ class KiltLoader {
     // However, I currently haven't found a way to link Kilt's mods into Quilt, so this is how it will
     // be for now.
     val modProvider: LoaderModProvider = FabricModProvider()
-
-    val scope = CoroutineScope(SupervisorJob())
 
     suspend fun scanMods() {
         Kilt.logger.info("Scanning the mods directory for Forge mods...")
@@ -94,7 +104,6 @@ class KiltLoader {
 
         if (!modsDir.exists() || !modsDir.isDirectory())
             throw IllegalStateException("Mods directory doesn't exist! ...how did you even get to this point?")
-
 
         val thrownExceptions = mutableMapOf<String, Exception>()
 
@@ -354,7 +363,7 @@ class KiltLoader {
     private fun fullLoadForgeBuiltin() {
         val mod = this.getMod("forge") ?: throw IllegalStateException("WHAT")
 
-        registerAnnotations(mod, mod.scanData)
+        runBlocking { registerAnnotations(mod, mod.scanData) }
         mod.eventBus.post(FMLConstructModEvent(mod, ModLoadingStage.CONSTRUCT))
     }
 
@@ -629,50 +638,52 @@ class KiltLoader {
 
         fullLoadForgeBuiltin()
 
-        while (modLoadingQueue.isNotEmpty()) {
-            try {
-                val mod = modLoadingQueue.remove()
-                DeltaTimeProfiler.push(mod.modId)
+        runBlocking {
+            launch(Dispatchers.Default) {
+                modLoadingQueue.asFlow().concurrent().onEach { mod ->
+                    try {
+                        if (!mod.shouldScan) {
+                            mod.scanData = ModFileScanData()
+                            mods.add(mod)
+                            exceptions.addAll(registerAnnotations(mod, mod.scanData))
 
-                if (!mod.shouldScan) {
-                    mod.scanData = ModFileScanData()
-                    mods.add(mod)
-                    exceptions.addAll(registerAnnotations(mod, mod.scanData))
-
-                    continue
-                }
-
-                val scanData = ModFileScanData()
-                scanData.addModFileInfo(ModFileInfo(mod))
-
-                mod.scanData = scanData
-
-                // basically emulate how Forge loads stuff
-                try {
-                    mod.jar.entries().asIterator().forEach {
-                        if (it.name.endsWith(".class")) {
-                            val inputStream = mod.jar.getInputStream(it)
-                            val visitor = ModClassVisitor()
-                            val classReader = ClassReader(inputStream)
-
-                            classReader.accept(visitor, 0)
-                            visitor.buildData(scanData.classes, scanData.annotations)
+                            return@onEach
                         }
+
+                        val scanData = ModFileScanData()
+                        scanData.addModFileInfo(ModFileInfo(mod))
+
+                        mod.scanData = scanData
+
+                        // basically emulate how Forge loads stuff
+                        launch {
+                            mod.jar.stream().consumeAsFlow().concurrent()
+                                .filter { it.name.endsWith(".class") }
+                                .map { withContext(Dispatchers.IO) { mod.jar.getInputStream(it) } }
+                                .collect {
+                                    val visitor = ModClassVisitor()
+                                    val classReader = ClassReader(it)
+
+                                    classReader.accept(visitor, 0)
+                                    visitor.buildData(scanData.classes, scanData.annotations)
+                                }
+
+                            mods.add(mod)
+                            // Avoid `ConcurrentModificationException`
+                            // when register the event for mods that need to find the context by `getMod`
+                            ModLoadingContext.contexts[mod.modId] = ModLoadingContext(mod)
+
+                            exceptions.addAll(registerAnnotations(mod, scanData))
+                        }.join()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        exceptions.add(e)
                     }
-
-                    mods.add(mod)
-
-                    exceptions.addAll(registerAnnotations(mod, scanData))
-                } catch (e: Exception) {
-                    throw e
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                exceptions.add(e)
-            } finally {
-                DeltaTimeProfiler.pop()
-            }
+                }.launchIn(this).join()
+            }.join()
         }
+
+        modLoadingQueue.clear()
 
         if (exceptions.isNotEmpty()) {
             FabricGuiEntry.displayError("Errors occurred while loading Forge mods!", null, {
@@ -690,13 +701,13 @@ class KiltLoader {
 
     private val launcher = FabricLauncherBase.getLauncher()
 
-    private fun registerAnnotations(mod: ForgeMod, scanData: ModFileScanData): List<Exception> {
+    private suspend fun registerAnnotations(mod: ForgeMod, scanData: ModFileScanData): List<Exception> {
         val exceptions = mutableListOf<Exception>()
 
         // Automatically subscribe events
-        scanData.annotations
+        scanData.annotations.asFlow()
             .filter { it.annotationType == AUTO_SUBSCRIBE_ANNOTATION }
-            .forEach {
+            .collect {
                 // it.annotationData["modid"] as String
                 // it.annotationData["bus"] as Mod.EventBusSubscriber.Bus
 
@@ -704,7 +715,7 @@ class KiltLoader {
                     val modId = it.annotationData["modid"] as String? ?: mod.modId
 
                     if (modId != mod.modId)
-                        return@forEach
+                        return@collect
 
                     val busType = Mod.EventBusSubscriber.Bus.valueOf(
                         if (it.annotationData.contains("bus"))

@@ -45,7 +45,7 @@ class ModLoadingContext(private val mod: ForgeMod) {
 
     companion object {
         // Mapped from Mod ID to ModLoadingContext
-        private val contexts = ConcurrentHashMap<String, ModLoadingContext>()
+        internal val contexts = ConcurrentHashMap<String, ModLoadingContext>()
         // Mapped from MD5 hash of mods.toml to Mod ID, makes things faster.
         private val tomlCache = ConcurrentHashMap<String, String>()
 
