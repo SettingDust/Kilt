@@ -26,8 +26,6 @@ class KiltEnhancedRemapper(provider: ClassProvider, file: IMappingFile, log: Con
             KiltRemapper.unmapClass(owner)
         else owner
 
-        val classOpt = this.classProvider.getClassBytes(actualOwnerName)
-
         if (mappedNames.contains(actualOwnerName)) {
             return mappedNames[actualOwnerName]!!
         }
@@ -35,8 +33,10 @@ class KiltEnhancedRemapper(provider: ClassProvider, file: IMappingFile, log: Con
         if (actualOwnerName.contains("java/lang/Object"))
             return null
 
-        if (classOpt.isPresent) {
-            val classReader = ClassReader(classOpt.get())
+        val classStream = this.classProvider.getClassStream(actualOwnerName)
+
+        if (classStream != null) {
+            val classReader = ClassReader(classStream)
             val classNode = ClassNode(Opcodes.ASM9)
             classReader.accept(classNode, 0)
 

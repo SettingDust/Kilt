@@ -9,6 +9,7 @@ import kotlinx.atomicfu.locks.synchronized
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.mapNotNull
@@ -49,8 +50,10 @@ import xyz.bluspring.kilt.util.collect
 import xyz.bluspring.kilt.util.concurrent
 import xyz.bluspring.kilt.util.filter
 import xyz.bluspring.kilt.util.flatMap
+import xyz.bluspring.kilt.util.launchIn
 import xyz.bluspring.kilt.util.map
 import xyz.bluspring.kilt.util.merge
+import xyz.bluspring.kilt.util.onEach
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Path
@@ -152,7 +155,9 @@ object KiltRemapper {
                     if (!f.mapped.startsWith("method_") && !FabricLoader.getInstance().isDevelopmentEnvironment)
                         return@collect
 
-                    val map = srgMappedMethods.getOrPut(f.original) { Object2ReferenceMaps.synchronize(Object2ReferenceOpenHashMap()) }
+                    val map = srgMappedMethods.getOrPut(f.original) {
+                        Object2ReferenceMaps.synchronize(Object2ReferenceOpenHashMap())
+                    }
                     val mapped = if (!forceProductionRemap)
                         mappingResolver.mapMethodName(
                             "intermediary",
@@ -193,7 +198,29 @@ object KiltRemapper {
 
         logger.info("Remapping Forge mods...")
 
-        suspend fun remapMod(file: Path, mod: ForgeMod, forgeModsList: Collection<ForgeMod>): List<Exception> {
+        val mods =
+            modLoadingQueue.asFlow().concurrent().filter { !it.isRemapped() && it.modFile != null }.merge(false).toSet()
+
+        // Use the regular mod file
+        val classProvider = ClassProvider.builder().apply {
+            merge(
+                flow { emit(srgGamePath) },
+                // List down Forge paths
+                KiltHelper.getKiltPaths().asFlow(),
+                // Add all Fabric mods
+                FabricLoader.getInstance().allMods.asFlow().concurrent()
+                    .flatMap { container -> container.rootPaths.asFlow() }.merge(false),
+                // add mapped path too
+                getGameClassPath().asFlow(),
+                // Add all Forge mods to the library path, because dependencies don't have to be specified
+                // in order to use mods lmao
+                modLoadingQueue.asFlow().mapNotNull { mod -> mod.modFile?.toPath() }
+            ).collect { addLibrary(it) }
+        }.build()
+
+        val remapper = KiltEnhancedRemapper(classProvider, srgIntermediaryMapping, logConsumer)
+
+        suspend fun remapMod(file: Path, mod: ForgeMod): List<Exception> {
             val exceptions = mutableListOf<Exception>()
 
             val hash = withContext(Dispatchers.IO) { DigestUtils.md5Hex(file.inputStream()) }
@@ -208,25 +235,6 @@ object KiltRemapper {
             val output = modifiedJarFile.outputStream()
             val jarOutput = withContext(Dispatchers.IO) { JarOutputStream(output) }
 
-            // Use the regular mod file
-            val classProvider = ClassProvider.builder().apply {
-                merge(
-                    flow { emit(srgGamePath) },
-                    // List down Forge paths
-                    KiltHelper.getKiltPaths().asFlow(),
-                    // Add all Fabric mods
-                    FabricLoader.getInstance().allMods.asFlow().concurrent()
-                        .flatMap { container -> container.rootPaths.asFlow() }.merge(false),
-                    // add mapped path too
-                    getGameClassPath().asFlow(),
-                    // Add all Forge mods to the library path, because dependencies don't have to be specified
-                    // in order to use mods lmao
-                    forgeModsList.asFlow().mapNotNull { mod -> mod.modFile?.toPath() },
-                    flow { emit(mod.modFile?.toPath()) }
-                ).concurrent().collect { addLibrary(it) }
-            }.build()
-
-            val remapper = KiltEnhancedRemapper(classProvider, srgIntermediaryMapping, logConsumer)
             val entryToClassNodes = Object2ReferenceMaps.synchronize(Object2ReferenceOpenHashMap<JarEntry, ClassNode>())
 
             val mixinClasses = ClassNameHashSet()
@@ -236,20 +244,22 @@ object KiltRemapper {
                 jar: JarFile,
                 manifestEntry: JarEntry,
                 jarOutput: JarOutputStream
-            ) = withContext(Dispatchers.IO) {
+            ): Manifest {
                 // Modify the manifest to avoid hash checking, because if
                 // hash checking occurs, the JAR will fail to load entirely.
                 val manifest = Manifest(jar.getInputStream(manifestEntry))
 
                 manifest.entries.keys.removeIf { it == "SHA-256-Digest" || it == "SHA-1-Digest" }
 
-                synchronized(jarOutput) {
-                    jarOutput.putNextEntry(manifestEntry)
-                    jarOutput.write(ByteArrayOutputStream().also { manifest.write(it) }.toByteArray())
-                    jarOutput.closeEntry()
+                withContext(Dispatchers.IO) {
+                    synchronized(jarOutput) {
+                        jarOutput.putNextEntry(manifestEntry)
+                        jarOutput.write(ByteArrayOutputStream().also { manifest.write(it) }.toByteArray())
+                        jarOutput.closeEntry()
+                    }
                 }
 
-                return@withContext manifest
+                return manifest
             }
 
             // JAR validation information stripping.
@@ -270,7 +280,7 @@ object KiltRemapper {
                     // Read mixin configs and add them to the list of mixins to fix
                     mixinConfigs.asFlow().concurrent().collect { config ->
                         val jsonEntry = jar.getJarEntry(config) ?: return@collect
-                        val data = withContext(Dispatchers.IO) { jar.getInputStream(jsonEntry) }.reader()
+                        val data = jar.getInputStream(jsonEntry).reader()
 
                         val json = JsonParser.parseReader(data).asJsonObject
 
@@ -300,16 +310,16 @@ object KiltRemapper {
                 jarOutput: JarOutputStream
             ) {
                 val refmapData =
-                    JsonParser.parseReader(withContext(Dispatchers.IO) { jar.getInputStream(entry) }.reader()).asJsonObject
+                    JsonParser.parseReader(jar.getInputStream(entry).reader()).asJsonObject
 
                 val refmapMappings = refmapData.getAsJsonObject("mappings")
                 val newMappings = JsonObject()
 
-                refmapMappings.keySet().asFlow().concurrent().collect { className ->
+                refmapMappings.keySet().forEach { className ->
                     val mapped = refmapMappings.getAsJsonObject(className)
                     val properMapped = JsonObject()
 
-                    mapped.entrySet().asFlow().concurrent().collect { (name, element) ->
+                    mapped.entrySet().forEach { (name, element) ->
                         val srgMappedString = element.asString
                         val srgClass = if (srgMappedString.startsWith("L"))
                             srgMappedString.replaceAfter(";", "")
@@ -482,17 +492,18 @@ object KiltRemapper {
                     this.add("named:intermediary", newMappings)
                 })
 
-                synchronized(jarOutput) {
-                    jarOutput.putNextEntry(entry)
-                    jarOutput.write(Kilt.gson.toJson(refmapData).toByteArray())
-                    jarOutput.closeEntry()
+                withContext(Dispatchers.IO) {
+                    synchronized(jarOutput) {
+                        jarOutput.putNextEntry(entry)
+                        Kilt.gson.toJson(refmapData, jarOutput.bufferedWriter())
+                        jarOutput.closeEntry()
+                    }
                 }
 
                 return
             }
 
             jar.stream().consumeAsFlow()
-                .concurrent()
                 .filter { !it.name.equals("META-INF/MANIFEST.MF", true) }
                 .filter {
                     val isHash = it.name.endsWith(".rsa", true) || it.name.endsWith(".sf", true)
@@ -510,10 +521,12 @@ object KiltRemapper {
 
                         // Keep the other resources
                         !entry.name.endsWith(".class") -> {
-                            synchronized(jarOutput) {
-                                jarOutput.putNextEntry(entry)
-                                jarOutput.write(jar.getInputStream(entry).readAllBytes())
-                                jarOutput.closeEntry()
+                            withContext(Dispatchers.IO) {
+                                synchronized(jarOutput) {
+                                    jarOutput.putNextEntry(entry)
+                                    jar.getInputStream(entry).copyTo(jarOutput)
+                                    jarOutput.closeEntry()
+                                }
                             }
                         }
 
@@ -535,7 +548,7 @@ object KiltRemapper {
                     .intersect(KiltHelper.getForgeClassNodes().toSet())
                     .toList()
 
-            fun remapClass(
+            suspend fun remapClass(
                 remapper: KiltEnhancedRemapper,
                 originalNode: ClassNode,
                 mixinClasses: ClassNameHashSet,
@@ -565,10 +578,12 @@ object KiltRemapper {
                     val classWriter = ClassWriter(0)
                     remappedNode.accept(classWriter)
 
-                    synchronized(jarOutput) {
-                        jarOutput.putNextEntry(entry)
-                        jarOutput.write(classWriter.toByteArray())
-                        jarOutput.closeEntry()
+                    withContext(Dispatchers.IO) {
+                        synchronized(jarOutput) {
+                            jarOutput.putNextEntry(entry)
+                            classWriter.toByteArray().inputStream().buffered().copyTo(jarOutput)
+                            jarOutput.closeEntry()
+                        }
                     }
                 } catch (e: Exception) {
                     logger.error("Failed to remap class ${entry.name}!", e)
@@ -576,34 +591,31 @@ object KiltRemapper {
                 }
             }
 
-            entryToClassNodes.asSequence().asFlow().concurrent()
-                .collect { (entry, originalNode) ->
-                    remapClass(
-                        remapper,
-                        originalNode,
-                        mixinClasses,
-                        classesToProcess,
-                        jarOutput,
-                        entry,
-                        exceptions
-                    )
-                }
+            entryToClassNodes.forEach { (entry, originalNode) ->
+                remapClass(
+                    remapper,
+                    originalNode,
+                    mixinClasses,
+                    classesToProcess,
+                    jarOutput,
+                    entry,
+                    exceptions
+                )
+            }
 
             mod.remappedModFile = modifiedJarFile.toFile()
             jarOutput.close()
+            jar.close()
 
             return exceptions
         }
 
-        val mods =
-            modLoadingQueue.asFlow().concurrent().filter { !it.isRemapped() && it.modFile != null }.merge(false).toSet()
-
         mods.asFlow().concurrent()
-            .collect { mod ->
+            .onEach { mod ->
                 runCatching {
                     logger.info("Remapping ${mod.displayName} (${mod.modId})")
                     val ms = measureTime {
-                        exceptions.addAll(remapMod(mod.modFile!!.toPath(), mod, mods))
+                        exceptions.addAll(remapMod(mod.modFile!!.toPath(), mod))
                     }.inWholeMilliseconds
                     logger.info("Remapped ${mod.displayName} (${mod.modId}) [took ${ms}ms]")
                 }.onFailure {
@@ -612,7 +624,9 @@ object KiltRemapper {
                         exceptions.add(it)
                     }
                 }
-            }
+            }.launchIn(Kilt.loader.scope).join()
+
+        classProvider.close()
 
         logger.info("Finished remapping mods!")
 
